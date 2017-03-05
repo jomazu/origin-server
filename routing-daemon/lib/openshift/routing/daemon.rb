@@ -197,6 +197,7 @@ module OpenShift
       subscription_hash = {
         'id' => @uuid,
         'ack' => 'client-individual',
+        'activemq.prefetchSize' => 1,
       }
 
       @logger.info "Subscribing to #{@destination}..."
@@ -225,13 +226,14 @@ module OpenShift
           begin
             handle YAML.load(msg.body)
           rescue Psych::SyntaxError => e
-            @logger.warn "Got exception while parsing message from ActiveMQ: #{e.message}"
+            @logger.warn "Got #{e.class} exception while parsing message from ActiveMQ: #{e.message}"
             # Acknowledge it to get it out of the queue.
             @aq.ack msgid, {'subscription' => @uuid}
-          rescue LBControllerException, LBModelException
-            @logger.info 'Got exception while handling message; sending NACK to ActiveMQ.'
+          rescue LBControllerException, LBModelException => e
+            @logger.info "Got #{e.class} exception while handling message; sending NACK to ActiveMQ: #{e.message}"
             @aq.nack msgid, {'subscription' => @uuid}
           else
+            @logger.debug 'Message handled; sending ACK to ActiveMQ.'
             @aq.ack msgid, {'subscription' => @uuid}
           end
         rescue Timeout::Error
@@ -239,6 +241,9 @@ module OpenShift
           # The connection to activemq has gone away, attempt a reconnect
           @logger.debug 'Connection to ActiveMQ is gone, attempting a reconnect'
           connect
+        rescue => e
+          @logger.warn "Got #{e.class} exception while handling message: #{e.message}"
+          @logger.debug "Backtrace:\n#{e.backtrace.join "\n"}"
         ensure
           update if Time.now - @last_update >= @update_interval
         end
@@ -246,27 +251,21 @@ module OpenShift
     end
 
     def handle event
-      begin
-        case event[:action]
-        when :delete_application
-          delete_application event[:app_name], event[:namespace]
-        when :add_public_endpoint
-          add_endpoint event[:app_name], event[:namespace], event[:public_address], event[:public_port], event[:types]
-        when :remove_public_endpoint
-          remove_endpoint event[:app_name], event[:namespace], event[:public_address], event[:public_port]
-        when :add_alias
-          add_alias event[:app_name], event[:namespace], event[:alias]
-        when :remove_alias
-          remove_alias event[:app_name], event[:namespace], event[:alias]
-        when :add_ssl
-          add_ssl event[:app_name], event[:namespace], event[:alias], event[:ssl], event[:private_key]
-        when :remove_ssl
-          remove_ssl event[:app_name], event[:namespace], event[:alias]
-        end
-
-      rescue => e
-        @logger.warn "Got an exception: #{e.message}"
-        @logger.debug "Backtrace:\n#{e.backtrace.join "\n"}"
+      case event[:action]
+      when :delete_application
+        delete_application event[:app_name], event[:namespace]
+      when :add_public_endpoint
+        add_endpoint event[:app_name], event[:namespace], event[:public_address], event[:public_port], event[:types]
+      when :remove_public_endpoint
+        remove_endpoint event[:app_name], event[:namespace], event[:public_address], event[:public_port]
+      when :add_alias
+        add_alias event[:app_name], event[:namespace], event[:alias]
+      when :remove_alias
+        remove_alias event[:app_name], event[:namespace], event[:alias]
+      when :add_ssl
+        add_ssl event[:app_name], event[:namespace], event[:alias], event[:ssl], event[:private_key]
+      when :remove_ssl
+        remove_ssl event[:app_name], event[:namespace], event[:alias]
       end
     end
 

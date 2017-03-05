@@ -70,6 +70,17 @@ module OpenShift
             raise LBModelException.new "Expected HTTP #{expected_code} but got #{response.code} instead"
           end
         end
+      rescue RestClient::Conflict => e
+        msg = "Got #{e.class} exception: #{e.message}"
+        begin
+          resp = JSON.parse e.response
+          m = resp['message']
+          msg += " (#{m})" unless m.empty?
+        rescue
+        end
+        msg += '; assuming the intended resource already exists and ignoring.'
+
+        @logger.warn msg
       rescue RestClient::ExceptionWithResponse => e
         raise unless options[:wrap_exceptions]
 
@@ -230,6 +241,7 @@ module OpenShift
             payload: {
                 "kind" => "ltm:pool:members",
                 "name" => member,
+                "partition" => "Common",
             }.to_json)
     end
 
@@ -358,17 +370,29 @@ module OpenShift
     end
 
     def remove_ssl pool_name, alias_str
-      @logger.debug("LTM removing #{URI.escape(alias_str)}-ssl-profile client-ssl from #{@https_vserver}")
-      delete(resource: "/mgmt/tm/ltm/virtual/#{@https_vserver}/profiles/#{URI.escape(alias_str)}-ssl-profile")
+      @exceptions = LBModelExceptionCollector.new
 
-      @logger.debug("LTM deleting removing #{URI.escape(alias_str)}-ssl-profile")
-      delete(resource: "/mgmt/tm/ltm/profile/client-ssl/#{URI.escape(alias_str)}-ssl-profile")
+      @exceptions.try do
+        @logger.debug("LTM removing #{URI.escape(alias_str)}-ssl-profile client-ssl from #{@https_vserver}")
+        delete(resource: "/mgmt/tm/ltm/virtual/#{@https_vserver}/profiles/#{URI.escape(alias_str)}-ssl-profile")
+      end
 
-      @logger.debug("LTM removing #{alias_str}-https-key")
-      delete(resource: "/mgmt/tm/sys/file/ssl-key/#{URI.escape(alias_str)}-https-key.key")
+      @exceptions.try do
+        @logger.debug("LTM deleting removing #{URI.escape(alias_str)}-ssl-profile")
+        delete(resource: "/mgmt/tm/ltm/profile/client-ssl/#{URI.escape(alias_str)}-ssl-profile")
+      end
 
-      @logger.debug("LTM removing #{alias_str}-https-cert")
-      delete(resource: "/mgmt/tm/sys/file/ssl-cert/#{URI.escape(alias_str)}-https-cert.crt")
+      @exceptions.try do
+        @logger.debug("LTM removing #{alias_str}-https-key")
+        delete(resource: "/mgmt/tm/sys/file/ssl-key/#{URI.escape(alias_str)}-https-key.key")
+      end
+
+      @exceptions.try do
+        @logger.debug("LTM removing #{alias_str}-https-cert")
+        delete(resource: "/mgmt/tm/sys/file/ssl-cert/#{URI.escape(alias_str)}-https-cert.crt")
+      end
+
+      @exceptions.done
     end
 
     def get_pool_certificates pool_name
@@ -414,7 +438,21 @@ module OpenShift
           patch(resource: policy_url, payload: { 'requires' => ['http'] }.to_json)
         end
       rescue RestClient::ResourceNotFound
-        @logger.info "No #{POLICY_NAME} policy exists.  Creating..."
+        begin
+          vserver_url = "/mgmt/tm/ltm/virtual/#{@vserver}"
+          get(resource: vserver_url, wrap_exceptions: false)
+        rescue RestClient::ResourceNotFound
+          raise LBModelException.new "#{@vserver} virtual server does not exist"
+        end
+
+        begin
+          https_vserver_url = "/mgmt/tm/ltm/virtual/#{@https_vserver}"
+          get(resource: https_vserver_url, wrap_exceptions: false)
+        rescue RestClient::ResourceNotFound
+          raise LBModelException.new "#{@https_vserver} virtual server does not exist"
+        end
+
+        @logger.info "No #{POLICY_NAME} policy exists.  Creating policy..."
         post(resource: "/mgmt/tm/ltm/policy",
              payload: {
                "kind" => "tm:ltm:policy:policystate",
@@ -425,22 +463,26 @@ module OpenShift
              }.to_json)
 
         # Create a noop rule for the policy so we can add the policy to the vservers
+        @logger.info 'Adding noop rule to policy...'
         post(resource: "/mgmt/tm/ltm/policy/#{POLICY_NAME}/rules",
          payload: {
            "kind" => "tm:ltm:policy:rules:rulesstate",
            "name" => "default_noop",
          }.to_json)
 
-        # Now add the policy to the virtual servers
+        @logger.info "Adding policy to #{@vserver} virtual server..."
         post(resource: "/mgmt/tm/ltm/virtual/#{@vserver}/policies",
              payload: {
                "name" => POLICY_NAME
              }.to_json)
 
+        @logger.info "Adding policy to #{@https_vserver} virtual server..."
         post(resource: "/mgmt/tm/ltm/virtual/#{@https_vserver}/policies",
              payload: {
                "name" => POLICY_NAME
              }.to_json)
+
+        @logger.info 'Done configuring policy.'
       end
     end
 
